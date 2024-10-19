@@ -12,6 +12,7 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/sessions"
 )
 
 // Структура для хранения информации о пользователе
@@ -185,6 +186,9 @@ type Claims struct {
 }
 
 // Обработчик для авторизации
+// Создаем ключ для сессии
+var store = sessions.NewCookieStore([]byte("your-secret-key"))
+
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var authReq AuthRequest
 	err := json.NewDecoder(r.Body).Decode(&authReq)
@@ -193,39 +197,59 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if authReq.Username == "user" && authReq.Password == "password" {
-		expirationTime := time.Now().Add(30 * time.Minute)
-		claims := &Claims{
-			Username: authReq.Username,
-			Role:     "user",
-			RegisteredClaims: jwt.RegisteredClaims{
-				ExpiresAt: jwt.NewNumericDate(expirationTime),
-				IssuedAt:  jwt.NewNumericDate(time.Now()),
-			},
-		}
-
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-		tokenString, err := token.SignedString(jwtKey)
-		if err != nil {
-			http.Error(w, "Could not create token", http.StatusInternalServerError)
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+	// Определяем роль пользователя на основе имени и пароля
+	var role string
+	if authReq.Username == "admin" && authReq.Password == "adminpassword" {
+		role = "admin"
+	} else if authReq.Username == "user" && authReq.Password == "password" {
+		role = "user"
 	} else {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
+
+	// Создаем JWT с указанием роли
+	expirationTime := time.Now().Add(30 * time.Minute)
+	claims := &Claims{
+		Username: authReq.Username,
+		Role:     role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		http.Error(w, "Could not create token", http.StatusInternalServerError)
+		return
+	}
+
+	// Сохранение данных о пользователе в сессии
+	session, _ := store.Get(r, "session-name")
+	session.Values["username"] = authReq.Username
+	session.Values["role"] = role
+	session.Values["authenticated"] = true
+	session.Save(r, w)
+
+	// Возвращаем токен клиенту
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 }
 
 func tokenValidMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Лог заголовка Authorization
 		tokenString := r.Header.Get("Authorization")
-		if tokenString == "" {
-			http.Error(w, "Missing authorization header", http.StatusUnauthorized)
+		log.Println("Authorization header:", tokenString)
+
+		if tokenString == "" || len(tokenString) < len("Bearer ") {
+			http.Error(w, "Missing or malformed authorization header", http.StatusUnauthorized)
 			return
 		}
 
+		// Удаление префикса "Bearer "
 		tokenString = tokenString[len("Bearer "):]
 
 		claims := &Claims{}
@@ -233,21 +257,65 @@ func tokenValidMiddleware(next http.Handler) http.Handler {
 			return jwtKey, nil
 		})
 
+		// Логируем ошибку, если она есть
 		if err != nil {
 			log.Println("Error parsing token:", err)
 			http.Error(w, "Invalid token", http.StatusUnauthorized)
 			return
 		}
 
+		// Логируем результат проверки токена
 		if !token.Valid {
 			log.Println("Token is not valid")
 			http.Error(w, "Invalid token", http.StatusUnauthorized)
 			return
 		}
 
+		// Логируем успешную авторизацию
 		log.Println("Token is valid for user:", claims.Username)
+
+		// Переходим к следующему обработчику
 		next.ServeHTTP(w, r)
 	})
+}
+
+func roleCheckMiddleware(allowedRoles ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Извлечение токена
+			tokenString := r.Header.Get("Authorization")
+			if tokenString == "" || len(tokenString) < len("Bearer ") {
+				http.Error(w, "Missing or malformed authorization header", http.StatusUnauthorized)
+				return
+			}
+
+			// Удаление префикса "Bearer "
+			tokenString = tokenString[len("Bearer "):]
+
+			claims := &Claims{}
+			token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+				return jwtKey, nil
+			})
+
+			if err != nil || !token.Valid {
+				http.Error(w, "Invalid token", http.StatusUnauthorized)
+				return
+			}
+
+			// Проверка роли
+			userRole := claims.Role
+			for _, role := range allowedRoles {
+				if role == userRole {
+					// Роль разрешена, продолжаем
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			// Если роль не разрешена
+			http.Error(w, "Forbidden: You don't have access to this resource", http.StatusForbidden)
+		})
+	}
 }
 
 func main() {
@@ -255,7 +323,7 @@ func main() {
 
 	router.HandleFunc("/login", loginHandler).Methods("POST")
 
-	// Защищенные маршруты
+	// Защищенные маршруты для всех авторизованных пользователей
 	protected := router.PathPrefix("/").Subrouter()
 	protected.Use(tokenValidMiddleware)
 	protected.HandleFunc("/users", getUsers).Methods("GET")
@@ -263,6 +331,11 @@ func main() {
 	protected.HandleFunc("/users", createUser).Methods("POST")
 	protected.HandleFunc("/users/{id}", updateUser).Methods("PUT")
 	protected.HandleFunc("/users/{id}", deleteUser).Methods("DELETE")
+
+	// Административные маршруты, доступные только для admin
+	adminProtected := router.PathPrefix("/admin").Subrouter()
+	adminProtected.Use(tokenValidMiddleware, roleCheckMiddleware("admin"))
+	adminProtected.HandleFunc("/admin/users", getUsers).Methods("GET") // Маршрут доступен только для admin
 
 	log.Println("Server started at :8000")
 	log.Fatal(http.ListenAndServe(":8000", router))
